@@ -77,6 +77,74 @@ def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount:
     return "on_demand"
 
 
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float = 1.25,
+    read_discount: float = 0.10,
+) -> bool:
+    """Extension 3: cache only pays for itself once reuse clears a break-even point.
+
+    write_cost_per_m and read_discount are both expressed as a MULTIPLE of the
+    normal (uncached) price/M-token -- e.g. a provider may charge ~1.25x to
+    WRITE a cache entry and ~0.10x to READ one back. Each read saves
+    (1 - read_discount) of normal price; the write cost is paid once. Caching
+    is worth it once accumulated read savings clear that one-time write cost.
+    """
+    savings_per_read = 1.0 - read_discount
+    if savings_per_read <= 0:
+        return False
+    return avg_cache_reads >= write_cost_per_m / savings_per_read
+
+
+def cache_break_even_reads(write_cost_per_m: float = 1.25, read_discount: float = 0.10) -> float:
+    """Minimum reuse count for a cached prefix to pay for its own write cost."""
+    savings_per_read = 1.0 - read_discount
+    if savings_per_read <= 0:
+        return float("inf")
+    return write_cost_per_m / savings_per_read
+
+
+# Extension 1 -- illustrative per-GPU-type spot interruption rates. Scarce,
+# high-demand SKUs (H100/H200/B200) get reclaimed more often than older,
+# lower-demand ones (A10G/L4) once every tenant wants the same scarce card.
+INTERRUPT_RATE_BY_GPU = {
+    "H100": 0.07, "H200": 0.08, "B200": 0.09,
+    "A100": 0.05, "MI300X": 0.06,
+    "A10G": 0.02, "L4": 0.015,
+}
+
+
+def recommend_tier_v2(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_type: str | None = None,
+    reserved_discount_3yr: float = 0.45,
+    reserved_discount_1yr: float = 0.28,
+    interrupt_rate_by_gpu: dict | None = None,
+) -> dict:
+    """Extension 1: tier policy aware of per-GPU spot risk + 1yr-vs-3yr reserved.
+
+    Differs from recommend_tier() in two ways:
+    - Spot risk varies by GPU type instead of a single flat interrupt_rate.
+    - A duty cycle that only clears the CHEAPER 1yr break-even (not the 3yr
+      one) is recommended 1yr reserved -- lower discount, lower commitment
+      risk -- rather than being force-fit into on_demand or a 3yr contract.
+    """
+    rates = interrupt_rate_by_gpu or INTERRUPT_RATE_BY_GPU
+    interrupt_rate = rates.get(gpu_type, 0.05)
+    duty = max(0.0, hours_per_day) / 24.0
+    be_3yr = break_even_utilization(reserved_discount_3yr)
+    be_1yr = break_even_utilization(reserved_discount_1yr)
+
+    if interruptible and hours_per_day < 24:
+        return {"tier": "spot", "interrupt_rate": interrupt_rate, "duty": round(duty, 3)}
+    if duty >= be_3yr:
+        return {"tier": "reserved_3yr", "interrupt_rate": interrupt_rate, "duty": round(duty, 3)}
+    if duty >= be_1yr:
+        return {"tier": "reserved_1yr", "interrupt_rate": interrupt_rate, "duty": round(duty, 3)}
+    return {"tier": "on_demand", "interrupt_rate": interrupt_rate, "duty": round(duty, 3)}
+
+
 def spot_checkpoint_cost(
     job_hours: float,
     spot_hr: float,

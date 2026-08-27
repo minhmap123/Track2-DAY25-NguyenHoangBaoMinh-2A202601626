@@ -47,5 +47,52 @@ def run(verbose: bool = True) -> dict:
     }
 
 
+def run_cache_extension(verbose: bool = True) -> dict:
+    """Extension 3 -- gate prompt-cache savings behind cache_is_worth_it().
+
+    Data has no explicit "times this prefix was reused" column, so we proxy
+    avg_cache_reads with the number of requests sharing a (team, project) --
+    those requests plausibly reuse the same cached system/context prefix.
+    Reports the break-even reuse count vs. the actual reuse in this traffic,
+    and what the optimized cost WOULD be if a project fell below break-even.
+    """
+    rows = load_csv("token_usage.csv")
+    group_sizes: dict[tuple[str, str], int] = {}
+    for r in rows:
+        key = (r["team"], r["project"])
+        group_sizes[key] = group_sizes.get(key, 0) + 1
+
+    break_even = pricing.cache_break_even_reads()
+    verdicts = {k: pricing.cache_is_worth_it(v) for k, v in group_sizes.items()}
+
+    gated_cost = 0.0
+    total_tokens = 0
+    for r in rows:
+        inp, out = int(num(r["input_tokens"])), int(num(r["output_tokens"]))
+        cached = int(num(r["cached_input_tokens"]))
+        is_batch = bool(int(num(r["is_batch"])))
+        total_tokens += inp + out
+        key = (r["team"], r["project"])
+        cached_in = cached if verdicts[key] else 0  # drop cache credit if not worth it
+        pin, pout = MODEL_PRICES[r["route_tier"]]
+        gated_cost += pricing.request_cost(inp, out, pin, pout, cached_in=cached_in, batch=is_batch)
+
+    gated_pm = pricing.dollars_per_million(gated_cost, total_tokens)
+
+    if verbose:
+        print("\n== Extension 3: cache_is_worth_it() gate ==")
+        print(f"break-even reuse count: {break_even:.2f} reads (write_cost=1.25x, read_discount=0.10x)")
+        print(f"{'team/project':28}{'reads':>8}{'worth it?':>12}")
+        for (team, project), n in sorted(group_sizes.items(), key=lambda kv: kv[1]):
+            print(f"{team + '/' + project:28}{n:>8}{'YES' if verdicts[(team, project)] else 'NO':>12}")
+        all_worth_it = all(verdicts.values())
+        note = "every group clears break-even -> no change" if all_worth_it else "some groups gated off"
+        print(f"\nGate-applied $/1M-token: ${gated_pm:.3f}  ({note})")
+
+    return {"break_even_reads": round(break_even, 2), "gated_per_m": round(gated_pm, 3),
+            "verdicts": {f"{k[0]}/{k[1]}": v for k, v in verdicts.items()}}
+
+
 if __name__ == "__main__":
     run()
+    run_cache_extension()
